@@ -27,3 +27,4 @@ void cleanup_unix_sockets(void);
 
 typedef bool (*pooler_cb)(void *arg, int fd, const PgAddr *addr);
 bool for_each_pooler_fd(pooler_cb cb, void *arg);
+void lb_pooler_accept(evutil_socket_t sock, short flags, void *arg);

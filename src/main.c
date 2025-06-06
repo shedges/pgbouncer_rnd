@@ -52,6 +52,7 @@ static void usage(const char *exe)
 	printf("  -v, --verbose        increase verbosity\n");
 	printf("  -V, --version        show version, then exit\n");
 	printf("  -h, --help           show this help, then exit\n");
+	printf("  -L, --loadbalancer             start pgbouncer as load balancer\n");
 	printf("\n");
 #ifdef WIN32
 	printf("Windows service registration:\n");
@@ -198,6 +199,13 @@ char *cf_server_tls_ciphers;
 
 int cf_max_prepared_statements;
 
+int cf_load_balancer = 0;
+int cf_total_load_balancer_pooler_count;
+int cf_load_balancer_admin_port;
+
+char *cf_pooler_load_balance_method;
+enum PoolerLoadBalanceMethods pooler_load_balance_method;
+
 /*
  * config file description
  */
@@ -245,6 +253,10 @@ const struct CfLookup load_balance_hosts_map[] = {
 	{ NULL }
 };
 
+const struct CfLookup pooler_load_balance_methods_map[] = {
+	{ "least-client-conn", POOLER_LOAD_BALANCE_LEAST_CLIENT_CONN },
+	{ "round-robin", POOLER_LOAD_BALANCE_ROUND_ROBIN },
+}
 /*
  * Add new parameters in alphabetical order. This order is used by SHOW CONFIG.
  */
@@ -351,6 +363,9 @@ static const struct CfKey bouncer_params [] = {
 	CF_ABS("user", CF_STR, global_username, CF_NO_RELOAD, NULL),
 #endif
 	CF_ABS("verbose", CF_INT, cf_verbose, 0, NULL),
+	CF_ABS("total_load_balancer_server", CF_INT, cf_total_load_balancer_pooler_count , 0, "0"),
+	CF_ABS("load_balancer_admin_port", CF_INT, cf_load_balancer_admin_port , CF_NO_RELOAD, "6432"),
+	CF_ABS("pooler_load_balance_method", CF_STR, char *cf_pooler_load_balance_method, 0, "least-client-conn"),
 
 	{NULL}
 };
@@ -934,6 +949,32 @@ static void xfree(char **ptr_p)
 	}
 }
 
+static void lb_setup(void)
+{
+	int index;
+
+	struct CfValue pooler_load_balance_methods_lookup;
+
+	/* Setting default pooler load balance method */
+	pooler_load_balance_method = POOLER_LOAD_BALANCE_LEAST_CLIENT_CONN;
+
+	load_balance_hosts_lookup.value_p = &pooler_load_balance_method;
+	load_balance_hosts_lookup.extra = (const void *)pooler_load_balance_methods_map;
+
+	if (!cf_set_lookup(&load_balance_hosts_lookup, cf_pooler_load_balance_method)) {
+		log_error("invalid pooler_load_balance_method: %s", cf_pooler_load_balance_method);
+	}
+
+	if (cf_load_balancer)
+	{
+		for(index = 1; index <= cf_total_load_balancer_pooler_count; index++)
+		{
+			/* TODO: Handle pooler failure scenarios KER-10544 */
+			connect_lb_pooler(index);
+		}
+	}
+}
+
 _UNUSED
 static void cleanup(void)
 {
@@ -1003,6 +1044,8 @@ static void cleanup(void)
 	xfree((char **)&cf_syslog_facility);
 
 	xfree(&cf_track_extra_parameters);
+
+	xfree(&cf_pooler_load_balance_method);
 }
 
 /* boot everything */
@@ -1021,13 +1064,14 @@ int main(int argc, char *argv[])
 		{"version", no_argument, NULL, 'V'},
 		{"reboot", no_argument, NULL, 'R'},
 		{"user", required_argument, NULL, 'u'},
+		{"loadbalancer", no_argument, NULL, 'L'},
 		{NULL, 0, NULL, 0}
 	};
 
 	setprogname(basename(argv[0]));
 
 	/* parse cmdline */
-	while ((c = getopt_long(argc, argv, "qvhdVRu:", long_options, &long_idx)) != -1) {
+	while ((c = getopt_long(argc, argv, "qvhdVRLu:", long_options, &long_idx)) != -1) {
 		switch (c) {
 		case 'R':
 			cf_reboot = 1;
@@ -1053,6 +1097,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'u':
 			arg_username = optarg;
+			break;
+		case 'L':
+			cf_load_balancer = 1;
 			break;
 		case 'h':
 			usage(argv[0]);
@@ -1142,6 +1189,7 @@ int main(int argc, char *argv[])
 	signal_setup();
 	janitor_setup();
 	stats_setup();
+	lb_setup();
 
 	pam_init();
 	auth_ldap_init();

@@ -353,6 +353,154 @@ static const char *conninfo(const PgSocket *sk)
 	}
 }
 
+/* API to send file description to pooler over UDS */
+static bool LBsendFD(int socket, int fd)
+{
+	struct msghdr msg = { 0 };
+	char buf[CMSG_SPACE(sizeof(fd))];
+	struct iovec io = { .iov_base = "ABC", .iov_len = 3 };
+	struct cmsghdr * cmsg;
+
+	memset(buf, '\0', sizeof(buf));
+	msg.msg_iov = &io;
+	msg.msg_iovlen = 1;
+	msg.msg_control = buf;
+	msg.msg_controllen = sizeof(buf);
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(fd));
+
+	*((int *) CMSG_DATA(cmsg)) = fd;
+
+	msg.msg_controllen = CMSG_SPACE(sizeof(fd));
+
+	if (sendmsg(socket, &msg, 0) < 0)
+	{
+		log_error("Failed to send message over UDS");
+		return false;
+	}
+	return true;
+
+}
+
+/* API to receive accept connection over UDS as file description */
+
+static int LBreceiveFD(int socket)  // receive fd from socket
+{
+	struct msghdr msg = {0};
+	unsigned char *data = NULL;
+
+	char m_buffer[256];
+	char c_buffer[256];
+	int fd;
+	struct cmsghdr * cmsg ;
+	struct iovec io = { .iov_base = m_buffer, .iov_len = sizeof(m_buffer) };
+	msg.msg_iov = &io;
+	msg.msg_iovlen = 1;
+
+	msg.msg_control = c_buffer;
+	msg.msg_controllen = sizeof(c_buffer);
+
+	if (recvmsg(socket, &msg, 0) < 0)
+	{
+		log_error("Failed to receive message over UDS");
+		return -1;
+	}
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	if (cmsg != NULL)
+	{
+		switch (cmsg->cmsg_type) {
+			case SCM_RIGHTS:
+				data = CMSG_DATA(cmsg);
+
+				fd = *((int*) data);
+				log_debug ("Pooler received fd %d\n", fd);
+				cmsg = CMSG_NXTHDR(&msg, cmsg);
+				break;
+			default:
+				log_info("Invalid cmsgp->cmsg_type");
+				break;
+		}
+	}
+
+	return fd;
+}
+
+/* got new connection, forward file description to pooler */
+static void lb_accept(evutil_socket_t sock, short flags, void *arg)
+{
+	int fd = -1;
+	union {
+		struct sockaddr_in in;
+		struct sockaddr_in6 in6;
+		struct sockaddr_un un;
+		struct sockaddr sa;
+	} raddr;
+	socklen_t len = sizeof(raddr);
+
+	if(!(flags & EV_READ)) {
+		log_warning("no EV_READ in lb_accept");
+		return;
+	}
+	
+	if (statlist_empty (&lb_pooler_list))
+	{
+		log_error ("No Pooler. Failed to forward request to pooler path.");
+		return;
+	}
+
+	/* get fd */
+	fd = safe_accept(sock, &raddr.sa, &len);
+	if (fd < 0) {
+		if (errno == EAGAIN)
+			return;
+		else if (errno == ECONNABORTED)
+			return;
+
+		/*
+		* probably fd limit, pointless to try often
+		* wait a bit, hope that admin resolves somehow
+		*/
+		log_error("accept() failed: %s", strerror(errno));
+		evtimer_assign(&ev_err, pgb_event_base, err_wait_func, NULL);
+		safe_evtimer_add(&ev_err, &err_timeout);
+		suspend_pooler();
+		return;
+	}
+
+	sendFD(fd);
+	close(fd);
+}
+
+/* got new connection as file description over UDS, associate it with client struct */
+void lb_pooler_accept(evutil_socket_t sock, short flags, void *arg)
+{
+	struct PgSocket *ls = arg;
+	int fd = -1;
+	PgSocket *client;
+	bool is_unix = pga_is_unix(&ls->remote_addr);
+
+	if(!(flags & EV_READ)) {
+		log_warning("no EV_READ in lb_pooler_accept");
+		return;
+	}
+
+	fd = LBreceiveFD(sock);
+	if ( fd < 0)
+	{
+		log_error ("Received invalid file descriptor : %d", fd);
+		return;
+	}
+
+	client = accept_client(fd, is_unix);
+
+	if (client)
+		slog_debug(client, "P: got connection: %s", conninfo(client));
+}
+
 /* got new connection, associate it with client struct */
 static void pool_accept(evutil_socket_t sock, short flags, void *arg)
 {
@@ -469,7 +617,16 @@ void resume_pooler(void)
 		ls = container_of(el, struct ListenSocket, node);
 		if (ls->active)
 			continue;
-		event_assign(&ls->ev, pgb_event_base, ls->fd, EV_READ | EV_PERSIST, pool_accept, ls);
+		/*
+		 * For load balancer we need to avoid parsing each and every request. Added separate
+		 * call back for load balancer which accept request and blindly forward to available
+		 * pooler.
+		 */
+		if (cf_load_balancer && (pga_port(&ls->addr) != cf_load_balancer_admin_port))
+			event_assign(&ls->ev, pgb_event_base, ls->fd, EV_READ | EV_PERSIST, lb_accept, ls);
+		else
+			event_assign(&ls->ev, pgb_event_base, ls->fd, EV_READ | EV_PERSIST, pool_accept, ls);
+
 		if (event_add(&ls->ev, NULL) < 0) {
 			log_warning("event_add failed: %s", strerror(errno));
 			return;
@@ -609,3 +766,63 @@ bool for_each_pooler_fd(pooler_cb cbfunc, void *arg)
 	}
 	return true;
 }
+
+
+bool sendFD_least_conn_LB(int fd)
+{
+
+}
+
+bool sendFD(int fd)
+{
+	switch(pooler_load_balance_method)
+	{
+		case POOLER_LOAD_BALANCE_LEAST_CLIENT_CONN:
+			return sendFD_least_conn_LB(fd);
+			break;
+		case POOLER_LOAD_BALANCE_ROUND_ROBIN:
+			return sendFB_round_robin_LB(fd);
+			break;
+		default:
+			fatal("invalid pooler load balance method: %d", pooler_load_balance_method);
+
+	}
+}
+
+bool sendFB_round_robin_LB(int fd)
+{
+	struct List *item;
+	bool is_forward = false;
+	PgLbPooler* lb_pooler, *last_lb_pooler;
+
+	item = statlist_last(&lb_pooler_list);
+	last_lb_pooler = container_of(item, PgLbPooler, head);
+
+	do
+	{
+		lb_pooler = pop_lb_pooler();
+		if (LBsendFD(lb_pooler->pooler_fd, fd))
+		{
+			push_lb_pooler(lb_pooler);
+			is_forward = true;
+			break;
+		}
+		/* TODO: Handle pooler failure scenarios KER-10544 */
+		push_lb_pooler(lb_pooler);
+	} while (last_lb_pooler != lb_pooler);
+
+	// TODO: Add metrics KER-10258
+	if (!is_forward)
+		log_error ("Failed to forward request to pooler path %s", lb_pooler->pooler_path);
+	else
+		log_debug ("Load balancer forwarded FD %d to pooler path %s", fd, lb_pooler->pooler_path);
+}
+
+/* API to get current load factor.
+ * This version simply evaluate load factor based on active
+ * client connections out of maximum client connections.
+ */
+ float get_load_factor()
+ {
+	 return static_cast<float>(get_active_client_count())/cf_max_client_conn;
+ }

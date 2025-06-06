@@ -21,6 +21,7 @@
  */
 
 #include "bouncer.h"
+#include "pooler.h"
 
 #include <usual/regex.h>
 #include <usual/netdb.h>
@@ -1163,6 +1164,59 @@ static bool admin_cmd_reload(PgSocket *admin, const char *arg)
 		return send_pooler_error(admin, true, "F0000", false, "RELOAD failed, see logs for additional details");
 }
 
+/* Command: ATTACH Load Balancer */
+static bool admin_cmd_attach_lb(PgSocket *admin, const char *arg)
+{
+	int err;
+	if (arg && *arg)
+		return syntax_error(admin);
+
+	if (!admin->admin_user)
+		return admin_error(admin, "admin access needed");
+
+	log_info("ATTACH_LB command issued");
+
+	if (!tune_socket(admin->sbuf.sock, pga_is_unix(&admin->remote_addr)))
+		return false;
+
+	err = event_del(&admin->sbuf.ev);
+	if (err < 0)
+	{
+		log_warning("admin_cmd_attach_lb: event_del failed: %s", strerror(errno));
+		return false;
+	}
+
+	event_assign( &admin->sbuf.ev, pgb_event_base, admin->sbuf.sock, EV_READ | EV_PERSIST, lb_pooler_accept, admin);
+	if (event_add(&admin->sbuf.ev, NULL) < 0) {
+		log_warning("admin_cmd_attach_lb event_add failed: %s", strerror(errno));
+		return false;
+	}
+
+	return true;
+}
+
+/* Command: Get Load Factor */
+static double admin_show_load_factor(PgSocket *admin, const char *arg)
+{
+	PktBuf *buf;
+	char load_factor[16];
+
+	buf = pktbuf_dynamic(64);
+	if (!buf) {
+		admin_error(admin, "no mem");
+		return true;
+	}
+
+	snprintf(load_factor, sizeof(load_factor), %.2f, get_load_factor());
+	pktbuf_write_RowDescription(buf, "ss", "key", "value");
+
+	pktbuf_write_DataRow(buf, "ss", "load_factor", load_factor);
+
+	admin_flush(admin, buf, "SHOW");
+
+	return true;
+}
+
 /* Command: SHUTDOWN */
 static bool admin_cmd_shutdown(PgSocket *admin, const char *arg)
 {
@@ -1657,6 +1711,7 @@ static struct cmd_lookup show_map [] = {
 	{"dns_hosts", admin_show_dns_hosts},
 	{"dns_zones", admin_show_dns_zones},
 	{"state", admin_show_state},
+	{"load_factor", admin_show_load_factor},
 	{NULL, NULL}
 };
 
@@ -1681,6 +1736,7 @@ static struct cmd_lookup cmd_list [] = {
 	{"shutdown", admin_cmd_shutdown},
 	{"suspend", admin_cmd_suspend},
 	{"wait_close", admin_cmd_wait_close},
+	{"attach_lb", admin_cmd_attach_lb},
 	{NULL, NULL}
 };
 

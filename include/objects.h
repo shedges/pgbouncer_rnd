@@ -24,6 +24,7 @@ extern struct StatList database_list;
 extern struct StatList peer_list;
 extern struct StatList autodatabase_idle_list;
 extern struct StatList login_client_list;
+extern struct StatList lb_pooler_list;		//Maintain list of pooler
 extern struct Slab *client_cache;
 extern struct Slab *server_cache;
 extern struct Slab *db_cache;
@@ -37,6 +38,7 @@ extern struct Slab *outstanding_request_cache;
 extern struct Slab *var_list_cache;
 extern struct Slab *server_prepared_statement_cache;
 extern PgPreparedStatement *prepared_statements;
+extern struct Slab *lb_pooler_cache;
 
 extern unsigned long long int last_pgsocket_id;
 
@@ -115,3 +117,11 @@ void init_objects(void);
 void init_caches(void);
 
 void objects_cleanup(void);
+
+PgLbPooler *find_lb_pooler(const char *path);
+PgLbPooler *add_update_lb_pooler(const char *path, int fd);
+void del_lb_pooler(const char *path);
+PgLbPooler *pop_lb_pooler(void);
+void push_lb_pooler(PgLbPooler *lb_pooler);
+bool connect_lb_pooler(int index);
+float get_load_factor();

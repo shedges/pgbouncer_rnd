@@ -33,6 +33,7 @@ STATLIST(database_list);
 STATLIST(pool_list);
 STATLIST(peer_list);
 STATLIST(peer_pool_list);
+STATLIST(lb_pooler_list);
 
 /* All locally defined users (in auth_file) are kept here. */
 struct AATree user_tree;
@@ -72,6 +73,7 @@ struct Slab *outstanding_request_cache;
 struct Slab *var_list_cache;
 struct Slab *server_prepared_statement_cache;
 unsigned long long int last_pgsocket_id;
+struct Slab *lb_pooler_cache;
 
 /*
  * libevent may still report events when event_del()
@@ -166,6 +168,13 @@ void init_objects(void)
 	peer_pool_cache = slab_create("peer_pool_cache", sizeof(PgPool), 0, NULL, USUAL_ALLOC);
 	pool_cache = slab_create("pool_cache", sizeof(PgPool), 0, NULL, USUAL_ALLOC);
 	outstanding_request_cache = slab_create("outstanding_request_cache", sizeof(OutstandingRequest), 0, NULL, USUAL_ALLOC);
+
+	if (cf_load_balancer)
+	{
+		lb_pooler_cache = slab_create("lb_pooler_cache", sizeof(PgLbPooler), 0, NULL, USUAL_ALLOC);
+		if (!lb_pooler_cache)
+			fatal("cannot create initial cache for load balancer pooler");
+	}
 
 	if (!user_cache || !db_cache || !peer_cache || !peer_pool_cache || !pool_cache)
 		fatal("cannot create initial caches");
@@ -2697,4 +2706,135 @@ void objects_cleanup(void)
 	var_list_cache = NULL;
 	slab_destroy(server_prepared_statement_cache);
 	server_prepared_statement_cache = NULL;
+	if (cf_load_balancer)
+	{
+		slab_destroy(lb_pooler_cache);
+		lb_pooler_cache = NULL;
+	}
+}
+
+/* find an existing load balancer pooler */
+PgLbPooler *find_lb_pooler(const char *path)
+{
+	struct List *item;
+	PgLbPooler *lb_pooler;
+	statlist_for_each(item, &lb_pooler_list)
+	{
+		lb_pooler = container_of(item, PgLbPooler, head);
+		if (strcmp(lb_pooler->pooler_path, path) == 0)
+			return lb_pooler;
+	}
+	return NULL;
+}
+
+/* add or update load balancer pooler */
+PgLbPooler *add_update_lb_pooler(const char *path, int fd)
+{
+	struct PgLbPooler *lb_pooler = find_lb_pooler(path);
+
+	if (lb_pooler == NULL)
+	{
+		lb_pooler = slab_alloc(lb_pooler_cache);
+		if (!lb_pooler)
+			return NULL;
+
+		list_init(&lb_pooler->head);
+		lb_pooler->pooler_path = strdup(path);
+		statlist_append(&lb_pooler_list, &lb_pooler->head);
+	}
+	lb_pooler->pooler_fd = fd;
+	return lb_pooler;
+}
+
+/* delete give pooler from pooler list */
+void del_lb_pooler(const char *path)
+{
+	struct PgLbPooler *lb_pooler = find_lb_pooler(path);
+	if (lb_pooler != NULL)
+	{
+		if (lb_pooler->pooler_path)
+			free(lb_pooler->pooler_path);
+
+		statlist_remove(&lb_pooler_list, &lb_pooler->head);
+		slab_free(lb_pooler_cache, lb_pooler);
+	}
+}
+
+/* pop pooler from begining of pooler list */
+PgLbPooler *pop_lb_pooler(void)
+{
+	return statlist_pop(&lb_pooler_list);
+}
+
+/* Add pooler to end of pooler list */
+void push_lb_pooler(PgLbPooler *lb_pooler)
+{
+	statlist_append(&lb_pooler_list, &lb_pooler->head);
+}
+
+/* API to attach load balancer to pooler */
+bool connect_lb_pooler(int index)
+{
+	struct sockaddr_un addr;
+	int ret, fd;
+	bool isSuccess = false;
+
+	memset(&addr, 0, sizeof(struct sockaddr_un));
+	addr.sun_family = AF_UNIX;
+	sprintf(addr.sun_path, "%s_%d/.s.PGSQL.%d", cf_unix_socket_dir, index, cf_listen_port);
+
+	// Create a unix domain socket
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd == -1)
+	{
+		/* TODO: Handle pooler failure scenarios KER-10544 */
+		log_error("Load balancer setup Failed to create socket.");
+		return false;
+	}
+	ret = connect(fd, (const struct sockaddr *)&addr, sizeof(struct sockaddr_un));
+
+	if (ret == -1)
+	{
+		log_error("Failed to connect to pooler %s.", addr.sun_path);
+		return false;
+	}
+
+	uint8_t data[512];
+	PktBuf pkt;
+	pktbuf_static(&pkt, data, sizeof(data));
+
+	pktbuf_write_generic(&pkt, PKT_STARTUP, "sssss", "database", "pgbouncer", "user", cf_admin_users, "");
+	if (safe_send(fd, pkt.buf, pkt.write_pos - pkt.send_pos, 0))
+	{
+		pktbuf_static(&pkt, data, sizeof(data));
+		pktbuf_reset(&pkt);
+
+		/* TODO: Handle pooler failure scenarios KER-10544 */
+		pktbuf_write_generic(&pkt, 'Q', "s", ATTACH_LB_QUERY);
+		if (safe_send(fd, pkt.buf, pkt.write_pos - pkt.send_pos, 0))
+		{
+			if (add_update_lb_pooler(addr.sun_path, fd))
+			{
+				log_info("Successfully added pooler %s to list", addr.sun_path);
+				isSuccess = true;
+			}
+			else
+			{
+				log_error("Failed to add pooler %s to list", addr.sun_path);
+			}
+		}
+		else
+		{
+			log_error("Failed to attach pooler %s to load balancer", addr.sun_path);
+		}
+	}
+	else
+	{
+		log_error("Failed to establish connection to pooler %s ", addr.sun_path);
+}
+
+	if (!isSuccess)
+		close(fd);
+
+	return isSuccess;
 }

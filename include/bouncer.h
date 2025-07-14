@@ -162,6 +162,7 @@ typedef struct ScramState ScramState;
 typedef struct PgPreparedStatement PgPreparedStatement;
 typedef enum ResponseAction ResponseAction;
 typedef enum ReplicationType ReplicationType;
+typedef struct PgLbPooler PgLbPooler;
 
 extern int cf_sbuf_len;
 
@@ -755,6 +756,23 @@ struct PgSocket {
 	SBuf sbuf;		/* stream buffer, must be last */
 };
 
+/*
+ * Structure to maintain details of single pooler. Each pooler
+ * can uniquely identified by pooler path.
+ */
+struct PgLbPooler
+{
+	struct List head;		/* list header for pool list */
+	int pooler_fd;			/* fd to pooler UDS path */
+	char *pooler_path;		/* unix socket name for pooler */
+	float load_factor;		/* load factor */
+};
+
+enum PoolerLoadBalanceMethods {
+	POOLER_LOAD_BALANCE_LEAST_CLIENT_CONN,
+	POOLER_LOAD_BALANCE_ROUND_ROBIN
+};
+
 #define RAW_IOBUF_SIZE  offsetof(IOBuf, buf)
 #define IOBUF_SIZE      (RAW_IOBUF_SIZE + cf_sbuf_len)
 
@@ -765,6 +783,8 @@ struct PgSocket {
 
 /* where the salt is temporarily stored */
 #define tmp_login_salt  cancel_key
+
+#define ATTACH_LB_QUERY "attach_lb"
 
 /* main.c */
 extern int cf_daemon;
@@ -842,6 +862,10 @@ extern int cf_pause_mode;
 extern int cf_shutdown;
 extern int cf_reboot;
 
+extern int cf_load_balancer;	//Flag to indicate pgbouncer running as load balancer
+extern int cf_total_load_balancer_pooler_count;	//Total number of pooler behind load balancer
+extern int cf_load_balancer_admin_port;	//Port used by load balancer to accept admin command
+
 extern unsigned int cf_max_packet_size;
 
 extern int cf_sbuf_loopcnt;
@@ -877,8 +901,12 @@ extern char *cf_server_tls_ciphers;
 
 extern int cf_max_prepared_statements;
 
+extern char *cf_pooler_load_balance_method;
+extern enum PoolerLoadBalanceMethods pooler_load_balance_method;
 extern const struct CfLookup pool_mode_map[];
 extern const struct CfLookup load_balance_hosts_map[];
+
+extern const struct CfLookup pooler_load_balance_methods_map[];
 
 extern usec_t g_suspend_start;
 

@@ -199,6 +199,9 @@ int cf_load_balancer = 0;
 int cf_total_load_balancer_pooler_count;
 int cf_load_balancer_admin_port;
 
+char *cf_pooler_load_balance_method;
+enum PoolerLoadBalanceMethods pooler_load_balance_method;
+
 /*
  * config file description
  */
@@ -243,6 +246,10 @@ const struct CfLookup load_balance_hosts_map[] = {
 	{ NULL }
 };
 
+const struct CfLookup pooler_load_balance_methods_map[] = {
+	{ "least-client-conn", POOLER_LOAD_BALANCE_LEAST_CLIENT_CONN },
+	{ "round-robin", POOLER_LOAD_BALANCE_ROUND_ROBIN },
+}
 /*
  * Add new parameters in alphabetical order. This order is used by SHOW CONFIG.
  */
@@ -348,6 +355,7 @@ static const struct CfKey bouncer_params [] = {
 	CF_ABS("verbose", CF_INT, cf_verbose, 0, NULL),
 	CF_ABS("total_load_balancer_server", CF_INT, cf_total_load_balancer_pooler_count , 0, "0"),
 	CF_ABS("load_balancer_admin_port", CF_INT, cf_load_balancer_admin_port , CF_NO_RELOAD, "6432"),
+	CF_ABS("pooler_load_balance_method", CF_STR, char *cf_pooler_load_balance_method, 0, "least-client-conn"),
 
 	{NULL}
 };
@@ -925,6 +933,18 @@ static void lb_setup(void)
 	bool isActive = false;
 	int fd;
 
+	struct CfValue pooler_load_balance_methods_lookup;
+
+	/* Setting default pooler load balance method */
+	pooler_load_balance_method = POOLER_LOAD_BALANCE_LEAST_CLIENT_CONN;
+
+	load_balance_hosts_lookup.value_p = &pooler_load_balance_method;
+	load_balance_hosts_lookup.extra = (const void *)pooler_load_balance_methods_map;
+
+	if (!cf_set_lookup(&load_balance_hosts_lookup, cf_pooler_load_balance_method)) {
+		log_error("invalid pooler_load_balance_method: %s", cf_pooler_load_balance_method);
+	}
+
 	if (cf_load_balancer)
 	{
 		for(index = 1; index <= cf_total_load_balancer_pooler_count; index++)
@@ -947,6 +967,9 @@ static void lb_setup(void)
 			{
 				log_error("Failed to add pooler %s to list", path);
 			}
+
+			/* TODO: Handle pooler failure scenarios KER-10544 */
+			connect_lb_pooler(index);
 		}
 	}
 }
@@ -1019,6 +1042,8 @@ static void cleanup(void)
 	xfree((char **)&cf_syslog_facility);
 
 	xfree(&cf_track_extra_parameters);
+
+	xfree(&cf_pooler_load_balance_method);
 }
 
 /* Initialize pgbouncer with parsed parameters */

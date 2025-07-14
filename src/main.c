@@ -52,6 +52,7 @@ static void usage(const char *exe)
 	printf("  -v, --verbose        increase verbosity\n");
 	printf("  -V, --version        show version, then exit\n");
 	printf("  -h, --help           show this help, then exit\n");
+	printf("  -L, --loadbalancer             start pgbouncer as load balancer\n");
 	printf("\n");
 #ifdef WIN32
 	printf("Windows service registration:\n");
@@ -77,7 +78,6 @@ struct Ident *parsed_ident;
  * configuration storage
  */
 
-long unsigned int cf_query_wait_notify;
 int cf_daemon;
 int cf_pause_mode = P_NONE;
 int cf_shutdown = SHUTDOWN_NONE;
@@ -115,7 +115,6 @@ int cf_tcp_user_timeout;
 int cf_auth_type = AUTH_TYPE_MD5;
 char *cf_auth_file;
 char *cf_auth_hba_file;
-char *cf_auth_ldap_parameter;
 char *cf_auth_ident_file;
 char *cf_auth_user;
 char *cf_auth_query;
@@ -135,7 +134,6 @@ int cf_max_user_client_connections;
 char *cf_server_reset_query;
 int cf_server_reset_query_always;
 char *cf_server_check_query;
-bool empty_server_check_query;
 usec_t cf_server_check_delay;
 int cf_server_fast_close;
 int cf_server_round_robin;
@@ -162,7 +160,6 @@ usec_t cf_cancel_wait_timeout;
 usec_t cf_client_idle_timeout;
 usec_t cf_client_login_timeout;
 usec_t cf_idle_transaction_timeout;
-usec_t cf_transaction_timeout;
 usec_t cf_suspend_timeout;
 
 usec_t g_suspend_start;
@@ -198,6 +195,10 @@ char *cf_server_tls_ciphers;
 
 int cf_max_prepared_statements;
 
+int cf_load_balancer = 0;
+int cf_total_load_balancer_pooler_count;
+int cf_load_balancer_admin_port;
+
 /*
  * config file description
  */
@@ -214,9 +215,6 @@ static const struct CfLookup auth_type_map[] = {
 	{ "hba", AUTH_TYPE_HBA },
 #ifdef HAVE_PAM
 	{ "pam", AUTH_TYPE_PAM },
-#endif
-#ifdef HAVE_LDAP
-	{ "ldap", AUTH_TYPE_LDAP },
 #endif
 	{ "scram-sha-256", AUTH_TYPE_SCRAM_SHA_256 },
 	{ NULL }
@@ -255,10 +253,9 @@ static const struct CfKey bouncer_params [] = {
 	CF_ABS("auth_file", CF_STR, cf_auth_file, 0, NULL),
 	CF_ABS("auth_hba_file", CF_STR, cf_auth_hba_file, 0, ""),
 	CF_ABS("auth_ident_file", CF_STR, cf_auth_ident_file, 0, NULL),
-	CF_ABS("auth_query", CF_STR, cf_auth_query, 0, "SELECT rolname, CASE WHEN rolvaliduntil < now() THEN NULL ELSE rolpassword END FROM pg_authid WHERE rolname=$1 AND rolcanlogin"),
+	CF_ABS("auth_query", CF_STR, cf_auth_query, 0, "SELECT usename, passwd FROM pg_shadow WHERE usename=$1"),
 	CF_ABS("auth_type", CF_LOOKUP(auth_type_map), cf_auth_type, 0, "md5"),
 	CF_ABS("auth_user", CF_STR, cf_auth_user, 0, NULL),
-	CF_ABS("auth_ldap_parameter", CF_STR, cf_auth_ldap_parameter, 0, NULL),
 	CF_ABS("autodb_idle_timeout", CF_TIME_USEC, cf_autodb_idle_timeout, 0, "3600"),
 	CF_ABS("client_idle_timeout", CF_TIME_USEC, cf_client_idle_timeout, 0, "0"),
 	CF_ABS("client_login_timeout", CF_TIME_USEC, cf_client_login_timeout, 0, "60"),
@@ -277,7 +274,6 @@ static const struct CfKey bouncer_params [] = {
 	CF_ABS("dns_nxdomain_ttl", CF_TIME_USEC, cf_dns_nxdomain_ttl, 0, "15"),
 	CF_ABS("dns_zone_check_period", CF_TIME_USEC, cf_dns_zone_check_period, 0, "0"),
 	CF_ABS("idle_transaction_timeout", CF_TIME_USEC, cf_idle_transaction_timeout, 0, "0"),
-	CF_ABS("transaction_timeout", CF_TIME_USEC, cf_transaction_timeout, 0, "0"),
 	CF_ABS("ignore_startup_parameters", CF_STR, cf_ignore_startup_params, 0, ""),
 	CF_ABS("job_name", CF_STR, cf_jobname, CF_NO_RELOAD, "pgbouncer"),
 	CF_ABS("listen_addr", CF_STR, cf_listen_addr, CF_NO_RELOAD, ""),
@@ -308,7 +304,7 @@ static const struct CfKey bouncer_params [] = {
 	CF_ABS("resolv_conf", CF_STR, cf_resolv_conf, CF_NO_RELOAD, ""),
 	CF_ABS("sbuf_loopcnt", CF_INT, cf_sbuf_loopcnt, 0, "5"),
 	CF_ABS("server_check_delay", CF_TIME_USEC, cf_server_check_delay, 0, "30"),
-	CF_ABS("server_check_query", CF_STR, cf_server_check_query, 0, "<empty>"),
+	CF_ABS("server_check_query", CF_STR, cf_server_check_query, 0, "select 1"),
 	CF_ABS("server_connect_timeout", CF_TIME_USEC, cf_server_connect_timeout, 0, "15"),
 	CF_ABS("server_fast_close", CF_INT, cf_server_fast_close, 0, "0"),
 	CF_ABS("server_idle_timeout", CF_TIME_USEC, cf_server_idle_timeout, 0, "600"),
@@ -337,7 +333,6 @@ static const struct CfKey bouncer_params [] = {
 	CF_ABS("tcp_keepalive", CF_INT, cf_tcp_keepalive, 0, "1"),
 	CF_ABS("tcp_keepcnt", CF_INT, cf_tcp_keepcnt, 0, "0"),
 	CF_ABS("tcp_keepidle", CF_INT, cf_tcp_keepidle, 0, "0"),
-	CF_ABS("query_wait_notify", CF_INT, cf_query_wait_notify, 0, "5"),
 	CF_ABS("tcp_keepintvl", CF_INT, cf_tcp_keepintvl, 0, "0"),
 	CF_ABS("tcp_socket_buffer", CF_INT, cf_tcp_socket_buffer, 0, "0"),
 	CF_ABS("tcp_user_timeout", CF_INT, cf_tcp_user_timeout, 0, "0"),
@@ -351,6 +346,8 @@ static const struct CfKey bouncer_params [] = {
 	CF_ABS("user", CF_STR, global_username, CF_NO_RELOAD, NULL),
 #endif
 	CF_ABS("verbose", CF_INT, cf_verbose, 0, NULL),
+	CF_ABS("total_load_balancer_server", CF_INT, cf_total_load_balancer_pooler_count , 0, "0"),
+	CF_ABS("load_balancer_admin_port", CF_INT, cf_load_balancer_admin_port , CF_NO_RELOAD, "6432"),
 
 	{NULL}
 };
@@ -443,40 +440,30 @@ static bool requires_auth_file(int auth_type)
 }
 
 /* config loading, tries to be tolerant to errors */
-bool load_config(void)
+void load_config(void)
 {
 	static bool loaded = false;
-	bool load_file_ok;
-	bool ok = true;
-	const char *q;
+	bool ok;
 
-	any_user_level_timeout_set = false;
-	empty_server_check_query = false;
 	any_user_level_client_timeout_set = false;
 
 	set_dbs_dead(true);
 	set_peers_dead(true);
 
 	/* actual loading */
-	load_file_ok = cf_load_file(&main_config, cf_config_file);
-	if (load_file_ok) {
+	ok = cf_load_file(&main_config, cf_config_file);
+	if (ok) {
 		/* load users if needed */
 		if (requires_auth_file(cf_auth_type))
 			loader_users_check();
 		loaded = true;
 	} else if (!loaded) {
-		ok = false;
 		die("cannot load config file");
 	} else {
 		log_warning("config file loading failed");
 		/* if ini file missing, don't kill anybody */
 		set_dbs_dead(false);
-		ok = false;
 	}
-
-	q = cf_server_check_query;
-	if (strcmpeq(q, "<empty>"))
-		empty_server_check_query = true;
 
 	if (cf_auth_type == AUTH_TYPE_HBA) {
 		struct Ident *ident;
@@ -506,8 +493,6 @@ bool load_config(void)
 	/* reopen logfile */
 	if (main_config.loaded)
 		reset_logging();
-
-	return ok;
 }
 
 /*
@@ -533,7 +518,7 @@ static void handle_sigterm(evutil_socket_t sock, short flags, void *arg)
 	if (cf_pause_mode == P_SUSPEND)
 		die("suspend was in progress, going down immediately");
 	cf_shutdown = SHUTDOWN_WAIT_FOR_CLIENTS;
-	cleanup_tcp_sockets();
+	cleanup_sockets();
 }
 
 static void handle_sigint(evutil_socket_t sock, short flags, void *arg)
@@ -551,7 +536,7 @@ static void handle_sigint(evutil_socket_t sock, short flags, void *arg)
 		die("suspend was in progress, going down immediately");
 	cf_pause_mode = P_PAUSE;
 	cf_shutdown = SHUTDOWN_WAIT_FOR_SERVERS;
-	cleanup_tcp_sockets();
+	cleanup_sockets();
 }
 
 #ifndef WIN32
@@ -877,7 +862,6 @@ static void main_loop_once(void)
 			log_warning("event_loop failed: %s", strerror(errno));
 	}
 	pam_poll();
-	ldap_poll();
 	per_loop_maint();
 	reuse_just_freed_objects();
 	rescue_timers();
@@ -934,6 +918,39 @@ static void xfree(char **ptr_p)
 	}
 }
 
+static void lb_setup(void)
+{
+	int index;
+	char path[500];
+	bool isActive = false;
+	int fd;
+
+	if (cf_load_balancer)
+	{
+		for(index = 1; index <= cf_total_load_balancer_pooler_count; index++)
+		{
+			sprintf(path, "%s_%d/.s.PGSQL.%d", cf_unix_socket_dir, index, cf_listen_port);
+			/* TODO: Handle pooler failure scenarios KER-10544 */
+			fd = connect_lb_pooler(path);
+
+			if (fd != -1)
+			{
+				// Able to attach pooler successfully
+				isActive = true;
+			}
+
+			if (add_lb_pooler(path, fd, isActive))
+			{
+				log_info("Successfully added pooler %s to list", path);
+			}
+			else
+			{
+				log_error("Failed to add pooler %s to list", path);
+			}
+		}
+	}
+}
+
 _UNUSED
 static void cleanup(void)
 {
@@ -975,7 +992,6 @@ static void cleanup(void)
 	xfree(&cf_auth_ident_file);
 	xfree(&cf_auth_dbname);
 	xfree(&cf_auth_hba_file);
-	xfree(&cf_auth_ldap_parameter);
 	xfree(&cf_auth_query);
 	xfree(&cf_auth_user);
 	xfree(&cf_server_reset_query);
@@ -1005,78 +1021,21 @@ static void cleanup(void)
 	xfree(&cf_track_extra_parameters);
 }
 
-/* boot everything */
-int main(int argc, char *argv[])
+/* Initialize pgbouncer with parsed parameters */
+int pgbouncer_init(int is_reboot, int is_verbose, int is_daemon, int is_quiet, 
+                   int is_loadbalancer, const char *username, const char *config_file)
 {
-	int c;
 	bool did_takeover = false;
-	char *arg_username = NULL;
-	int long_idx;
 
-	static const struct option long_options[] = {
-		{"quiet", no_argument, NULL, 'q'},
-		{"verbose", no_argument, NULL, 'v'},
-		{"help", no_argument, NULL, 'h'},
-		{"daemon", no_argument, NULL, 'd'},
-		{"version", no_argument, NULL, 'V'},
-		{"reboot", no_argument, NULL, 'R'},
-		{"user", required_argument, NULL, 'u'},
-		{NULL, 0, NULL, 0}
-	};
-
-	setprogname(basename(argv[0]));
-
-	/* parse cmdline */
-	while ((c = getopt_long(argc, argv, "qvhdVRu:", long_options, &long_idx)) != -1) {
-		switch (c) {
-		case 'R':
-			cf_reboot = 1;
-			break;
-		case 'v':
-			cf_verbose++;
-			break;
-		case 'V':
-			printf("%s\n", PACKAGE_STRING);
-			printf("libevent %s\nadns: %s\ntls: %s\n",
-			       event_get_version(),
-			       adns_get_backend(),
-			       tls_backend_version());
-#ifdef USE_SYSTEMD
-			printf("systemd: yes\n");
-#endif
-			return 0;
-		case 'd':
-			cf_daemon = 1;
-			break;
-		case 'q':
-			cf_quiet = 1;
-			break;
-		case 'u':
-			arg_username = optarg;
-			break;
-		case 'h':
-			usage(argv[0]);
-			break;
-		default:
-			fprintf(stderr, "Try \"%s --help\" for more information.\n", argv[0]);
-			exit(1);
-			break;
-		}
-	}
-	if (optind + 1 != argc) {
-		fprintf(stderr, "%s: no configuration file specified\n", argv[0]);
-		fprintf(stderr, "Try \"%s --help\" for more information.\n", argv[0]);
-		exit(1);
-	}
-	cf_config_file = xstrdup(argv[optind]);
+	if (is_reboot) cf_reboot = 1;
+	if (is_verbose) cf_verbose = is_verbose;
+	if (is_daemon) cf_daemon = 1;
+	if (is_quiet) cf_quiet = 1;
+	if (is_loadbalancer) cf_load_balancer = 1;
+	
+	cf_config_file = xstrdup(config_file);
 
 #ifdef CASSERT
-	/*
-	 * Clean up all objects at the end, only for testing the
-	 * cleanup code, not useful for production.  This must be the
-	 * first atexit() call, since other atexit() handlers still
-	 * make use of things that will be cleaned up.
-	 */
 	atexit(cleanup);
 #endif
 
@@ -1090,17 +1049,14 @@ int main(int argc, char *argv[])
 	if (!sbuf_tls_setup())
 		die("TLS setup failed");
 
-	/* prefer cmdline over config for username */
-	if (arg_username) {
+	if (username) {
 		free(global_username);
-		global_username = xstrdup(arg_username);
+		global_username = xstrdup(username);
 	}
 
-	/* switch user is needed */
 	if (global_username && *global_username)
 		change_user(global_username);
 
-	/* disallow running as root */
 	if (getuid() == 0)
 		die("PgBouncer should not run as root");
 
@@ -1130,11 +1086,8 @@ int main(int argc, char *argv[])
 		log_warning("apparently running under systemd with notify socket, but systemd support was not built");
 #endif
 
-	/* need to do that after loading config; also do after
-	 * go_daemon() so that output goes to log file */
 	check_limits();
 
-	/* initialize subsystems, order important */
 	srandom(time(NULL) ^ getpid());
 	if (!(pgb_event_base = event_base_new()))
 		die("event_base_new() failed");
@@ -1142,9 +1095,9 @@ int main(int argc, char *argv[])
 	signal_setup();
 	janitor_setup();
 	stats_setup();
+	lb_setup();
 
 	pam_init();
-	auth_ldap_init();
 
 	if (did_takeover) {
 		takeover_finish();
@@ -1159,6 +1112,88 @@ int main(int argc, char *argv[])
 		 tls_backend_version());
 
 	sd_notify(0, "READY=1");
+
+	return 0;
+}
+
+void pgbouncer_work()
+{
+	
+}
+
+/* boot everything */
+int main(int argc, char *argv[])
+{
+	int c;
+	int is_reboot = 0, is_verbose = 0, is_daemon = 0, is_quiet = 0, is_loadbalancer = 0;
+	char *username = NULL;
+	int long_idx;
+	int result;
+
+	static const struct option long_options[] = {
+		{"quiet", no_argument, NULL, 'q'},
+		{"verbose", no_argument, NULL, 'v'},
+		{"help", no_argument, NULL, 'h'},
+		{"daemon", no_argument, NULL, 'd'},
+		{"version", no_argument, NULL, 'V'},
+		{"reboot", no_argument, NULL, 'R'},
+		{"user", required_argument, NULL, 'u'},
+		{"loadbalancer", no_argument, NULL, 'L'},
+		{NULL, 0, NULL, 0}
+	};
+
+	setprogname(basename(argv[0]));
+
+	/* parse cmdline */
+	while ((c = getopt_long(argc, argv, "qvhdVRLu:", long_options, &long_idx)) != -1) {
+		switch (c) {
+		case 'R':
+			is_reboot = 1;
+			break;
+		case 'v':
+			is_verbose++;
+			break;
+		case 'V':
+			printf("%s\n", PACKAGE_STRING);
+			printf("libevent %s\nadns: %s\ntls: %s\n",
+			       event_get_version(),
+			       adns_get_backend(),
+			       tls_backend_version());
+#ifdef USE_SYSTEMD
+			printf("systemd: yes\n");
+#endif
+			return 0;
+		case 'd':
+			is_daemon = 1;
+			break;
+		case 'q':
+			is_quiet = 1;
+			break;
+		case 'u':
+			username = optarg;
+			break;
+		case 'L':
+			is_loadbalancer = 1;
+			break;
+		case 'h':
+			usage(argv[0]);
+			break;
+		default:
+			fprintf(stderr, "Try \"%s --help\" for more information.\n", argv[0]);
+			exit(1);
+			break;
+		}
+	}
+	if (optind + 1 != argc) {
+		fprintf(stderr, "%s: no configuration file specified\n", argv[0]);
+		fprintf(stderr, "Try \"%s --help\" for more information.\n", argv[0]);
+		exit(1);
+	}
+
+	result = pgbouncer_init(is_reboot, is_verbose, is_daemon, is_quiet, 
+	                        is_loadbalancer, username, argv[optind]);
+	if (result != 0)
+		return result;
 
 	/* main loop */
 	while (cf_shutdown != SHUTDOWN_IMMEDIATE)

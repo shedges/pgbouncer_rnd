@@ -2,8 +2,10 @@
 include config.mak
 
 bin_PROGRAMS = pgbouncer
+lib_LIBRARIES = libpgbouncer.a
 
-pgbouncer_SOURCES = \
+# Shared sources for both binary and library
+PGBOUNCER_COMMON_SOURCES = \
 	src/admin.c \
 	src/client.c \
 	src/dnslookup.c \
@@ -11,7 +13,6 @@ pgbouncer_SOURCES = \
 	src/janitor.c \
 	src/loader.c \
 	src/messages.c \
-	src/main.c \
 	src/objects.c \
 	src/pam.c \
 	src/ldapauth.c \
@@ -34,6 +35,10 @@ pgbouncer_SOURCES = \
 	src/common/scram-common.c \
 	src/common/unicode_norm.c \
 	src/common/wchar.c \
+
+pgbouncer_SOURCES = \
+	$(PGBOUNCER_COMMON_SOURCES) \
+	src/main.c \
 	include/admin.h \
 	include/bouncer.h \
 	include/client.h \
@@ -69,6 +74,12 @@ pgbouncer_SOURCES = \
 	include/common/unicode_norm.h \
 	include/common/unicode_norm_table.h \
 	include/common/uthash_lowercase.h
+
+# Library configuration
+libpgbouncer_a_SOURCES = $(PGBOUNCER_COMMON_SOURCES)
+libpgbouncer_a_CPPFLAGS = $(pgbouncer_CPPFLAGS)
+
+
 
 UTHASH = uthash
 pgbouncer_CPPFLAGS = -Iinclude $(CARES_CFLAGS) $(LIBEVENT_CFLAGS) $(TLS_CPPFLAGS) $(LDAP_CFLAGS)
